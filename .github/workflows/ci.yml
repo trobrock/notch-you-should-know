@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out extension
+        uses: actions/checkout@v4
+        with:
+          path: extension
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Run tests
+        working-directory: extension
+        run: python -m unittest test_ysk.py
+      - name: Check out Notch
+        uses: actions/checkout@v4
+        with:
+          repository: trobrock/notch
+          path: notch
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: notch/go.mod
+          cache-dependency-path: notch/go.sum
+      - name: Validate package
+        working-directory: notch
+        run: go run ./cmd/notch extensions validate ../extension

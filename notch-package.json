@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "notch-you-should-know",
+  "version": "0.1.0",
+  "description": "Jev-gated independent observer for Notch coding sessions",
+  "license": "MIT",
+  "homepage": "https://github.com/trobrock/notch-you-should-know",
+  "extensions": [
+    "extensions"
+  ]
+}

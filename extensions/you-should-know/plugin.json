@@ -1,0 +1,5 @@
+{
+  "name": "you-should-know",
+  "command": ["python3", "ysk.py"],
+  "enabled": true
+}
