@@ -1,6 +1,10 @@
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
+import threading
+import time
 import unittest
 
 MODULE = pathlib.Path(__file__).parent / "extensions" / "you-should-know" / "ysk.py"
@@ -91,6 +95,54 @@ class YouShouldKnowTests(unittest.TestCase):
         self.assertIn("--no-tools", args)
         self.assertIn("--no-extensions", args)
         self.assertIn("--max-turns", args)
+
+    def test_timed_out_host_call_sends_cancellation(self):
+        rpc = ysk.RPC()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaises(TimeoutError):
+                rpc.host("host.slow", {}, timeout=0.001)
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(messages[0]["method"], "host.slow")
+        self.assertEqual(messages[1]["method"], "$/cancelRequest")
+        self.assertEqual(messages[1]["params"]["id"], messages[0]["id"])
+
+    def test_session_switch_discards_in_flight_review(self):
+        class RecordingRPC:
+            def __init__(self):
+                self.calls = []
+
+            def host(self, method, params, timeout=50):
+                self.calls.append((method, params))
+                return None
+
+        rpc = RecordingRPC()
+        observer = ysk.Observer(rpc)
+        observer.session_id = "old-session"
+        observer.messages = [{"role": "user", "content": [{"type": "text", "text": "check this"}]}]
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_jev(_source, _timeout):
+            started.set()
+            release.wait(1)
+            return {"probability": 0.0, "usage": {"input_tokens": 1}}
+
+        observer.run_jev = blocked_jev
+        thread = observer.start_review(force=True, deadline=time.monotonic() + 2)
+        self.assertIsNotNone(thread)
+        self.assertTrue(started.wait(1))
+        observer.reset_session()
+        observer.session_id = "new-session"
+        release.set()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(observer.jev_calls, 0)
+        self.assertFalse(
+            any(method == "host.session.append" for method, _params in rpc.calls),
+            rpc.calls,
+        )
 
     def test_empty_durable_state_does_not_warn(self):
         class EmptyRPC:
