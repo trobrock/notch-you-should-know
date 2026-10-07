@@ -216,7 +216,9 @@ class RPC:
         self.send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
         if not event.wait(timeout):
             with self.pending_lock:
-                self.pending.pop(ident, None)
+                pending = self.pending.pop(ident, None)
+            if pending is not None:
+                self.send({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": ident}})
             raise TimeoutError(f"{method} timed out")
         if "error" in slot:
             raise RuntimeError(slot["error"].get("message", f"{method} failed"))
@@ -275,9 +277,16 @@ class Observer:
         except Exception:
             return None
 
-    def append(self, kind: str, data: dict[str, Any], timeout: float = 50) -> None:
-        with self.lock:
-            session_id = self.session_id
+    def append(
+        self,
+        kind: str,
+        data: dict[str, Any],
+        timeout: float = 50,
+        session_id: str | None = None,
+    ) -> None:
+        if session_id is None:
+            with self.lock:
+                session_id = self.session_id
         if not session_id:
             return
         self.rpc.host("host.session.append", {"session_id": session_id, "kind": kind, "data": data}, timeout)
@@ -379,11 +388,20 @@ class Observer:
             ui_timeout,
         )
 
-    def add_usage(self, record: dict[str, Any], persist: bool = True, deadline: float | None = None) -> None:
+    def add_usage(
+        self,
+        record: dict[str, Any],
+        persist: bool = True,
+        deadline: float | None = None,
+        epoch: int | None = None,
+        session_id: str | None = None,
+    ) -> bool:
         provider = record.get("provider")
         cost = record.get("cost")
         known = isinstance(cost, (int, float)) and math.isfinite(cost) and cost >= 0
         with self.lock:
+            if epoch is not None and epoch != self.epoch:
+                return False
             if provider == "jev":
                 self.jev_calls += 1
                 self.jev_cost += float(cost) if known else 0
@@ -393,10 +411,16 @@ class Observer:
                 self.model_cost += float(cost) if known else 0
                 self.model_unknown |= not known
             else:
-                return
+                return False
         if persist:
-            self.append(f"{KEY}-usage", record, self.remaining(deadline) if deadline else 50)
+            self.append(
+                f"{KEY}-usage",
+                record,
+                self.remaining(deadline) if deadline else 50,
+                session_id,
+            )
         self.publish(self.remaining(deadline) if deadline else 50)
+        return True
 
     def update_context(self, event: dict[str, Any]) -> None:
         messages = event.get("messages")
@@ -434,12 +458,13 @@ class Observer:
                 return None
             self.last_started = time.monotonic()
             epoch = self.epoch
+            session_id = self.session_id
             previous = self.previous
             threshold = self.threshold
             review_deadline = deadline or (time.monotonic() + REVIEW_TIMEOUT)
             thread = threading.Thread(
                 target=self.review,
-                args=(source, previous, threshold, epoch, review_deadline),
+                args=(source, previous, threshold, epoch, session_id, review_deadline),
                 daemon=True,
                 name="ysk-review",
             )
@@ -555,7 +580,15 @@ class Observer:
             raise TimeoutError("YSK review exceeded its deadline")
         return remaining
 
-    def review(self, source: str, previous: str, threshold: float, epoch: int, deadline: float) -> None:
+    def review(
+        self,
+        source: str,
+        previous: str,
+        threshold: float,
+        epoch: int,
+        session_id: str,
+        deadline: float,
+    ) -> None:
         try:
             state = f"Previous YSK note: {previous or 'none'}\n\nTranscript:\n{source}"
             decision = self.run_jev(state, self.remaining(deadline))
@@ -565,7 +598,13 @@ class Observer:
             usage = decision.get("usage") if isinstance(decision.get("usage"), dict) else {}
             tokens = usage.get("input_tokens")
             cost = tokens * 0.042 / 1_000_000 if isinstance(tokens, (int, float)) and tokens >= 0 else None
-            self.add_usage({"provider": "jev", "cost": cost}, deadline=deadline)
+            if not self.add_usage(
+                {"provider": "jev", "cost": cost},
+                deadline=deadline,
+                epoch=epoch,
+                session_id=session_id,
+            ):
+                return
             note = ""
             if decision["probability"] >= threshold:
                 output, model_usage = self.run_model(source, previous, self.remaining(deadline))
@@ -573,7 +612,13 @@ class Observer:
                     if epoch != self.epoch or not self.enabled:
                         return
                 model_cost = model_usage.get("cost_usd")
-                self.add_usage({"provider": "model", "cost": model_cost}, deadline=deadline)
+                if not self.add_usage(
+                    {"provider": "model", "cost": model_cost},
+                    deadline=deadline,
+                    epoch=epoch,
+                    session_id=session_id,
+                ):
+                    return
                 note = sanitize_note(output)
             with self.lock:
                 if epoch != self.epoch or not self.enabled:
@@ -584,7 +629,7 @@ class Observer:
                     self.previous = self.note
                 self.warned_error = ""
                 saved = {"note": self.note, "previous": self.previous}
-            self.append(f"{KEY}-note", saved, self.remaining(deadline))
+            self.append(f"{KEY}-note", saved, self.remaining(deadline), session_id)
         except Exception as exc:
             message = sanitize_note(str(exc)) or "YSK observer failed"
             with self.lock:
